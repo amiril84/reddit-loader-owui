@@ -1,0 +1,106 @@
+services:
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: open-webui
+    restart: unless-stopped
+    depends_on:
+      searxng:
+        condition: service_started
+      reddit-loader:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:3000:8080"
+    environment:
+      WEBUI_SECRET_KEY: "${WEBUI_SECRET_KEY}"
+
+      ENABLE_WEB_SEARCH: "true"
+      WEB_SEARCH_ENGINE: "searxng"
+      WEB_SEARCH_RESULT_COUNT: "5"
+      WEB_SEARCH_CONCURRENT_REQUESTS: "5"
+      SEARXNG_QUERY_URL: "http://searxng:8080/search?q=<query>"
+      SEARXNG_LANGUAGE: "all"
+
+      WEB_LOADER_ENGINE: "external"
+      EXTERNAL_WEB_LOADER_URL: "http://reddit-loader:8080/load"
+      EXTERNAL_WEB_LOADER_API_KEY: "${LOADER_API_KEY}"
+      WEB_LOADER_CONCURRENT_REQUESTS: "1"
+      WEB_LOADER_TIMEOUT: "60"
+
+    volumes:
+      - open-webui-data:/app/backend/data
+    networks:
+      - owui-net
+
+  reddit-loader:
+    build:
+      context: ./reddit-loader
+    image: owui-reddit-loader:1.0.0
+    container_name: reddit-loader
+    restart: unless-stopped
+    init: true
+    shm_size: "256mb"
+    env_file:
+      - .proxy.env
+    environment:
+      LOADER_API_KEY: "${LOADER_API_KEY}"
+      PORT: "8080"
+      BROWSER_DATA_DIR: "/data/browser"
+      BROWSER_HEADLESS: "false"
+      NAVIGATION_TIMEOUT_MS: "45000"
+      REQUEST_TIMEOUT_MS: "30000"
+      MAX_RESPONSE_BYTES: "10485760"
+    volumes:
+      - reddit-browser-data:/data/browser
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:8080/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    networks:
+      - owui-net
+
+  searxng:
+    image: docker.io/searxng/searxng:latest
+    container_name: searxng
+    restart: unless-stopped
+    environment:
+      SEARXNG_SECRET: "${SEARXNG_SECRET}"
+      SEARXNG_BASE_URL: "http://searxng:8080/"
+    volumes:
+      - ./searxng/settings.yml:/etc/searxng/settings.yml:ro
+      - searxng-cache:/var/cache/searxng
+    networks:
+      - owui-net
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: caddy
+    restart: unless-stopped
+    depends_on:
+      - open-webui
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    networks:
+      - owui-net
+
+networks:
+  owui-net:
+    name: owui-net
+
+volumes:
+  open-webui-data:
+  reddit-browser-data:
+  searxng-cache:
+  caddy-data:
+  caddy-config:

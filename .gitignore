@@ -1,0 +1,21 @@
+# Secrets
+.env
+.proxy.env
+*.pem
+*.key
+
+# Dependencies and local state
+node_modules/
+data/
+.cache/
+
+# Logs and archives
+*.log
+logs.txt
+logs.zip
+
+# Editor and operating-system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
