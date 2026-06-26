@@ -1,22 +1,25 @@
-# Reddit Browser Loader for Open WebUI
+# Reddit and Threads Browser Loader for Open WebUI
 
 An internal adapter that enables Open WebUI deployments on networks where
 Reddit is blocked or unreliable to search, open, and extract Reddit content
-automatically.
+automatically. It also supports public logged-out Threads post and series URLs
+through the same browser infrastructure.
 
 The project preserves Open WebUI's existing web-search workflow:
 
 - SearXNG continues to discover search results.
 - Reddit URLs are rendered with Chromium/Playwright through a residential
   proxy.
-- Non-Reddit URLs are fetched directly without consuming residential proxy
+- Threads URLs are rendered with the same Chromium/Playwright context and
+  extract visible public post, series, reply, count, and post-link content.
+- Other URLs are fetched directly without consuming residential proxy
   bandwidth.
 - Extracted content is returned through Open WebUI's external web-loader
   contract for model context, RAG, and citations.
 
 The implementation has been validated with subreddit pages, posts, comments,
-`redd.it` redirects, SearXNG results, non-Reddit URLs, container restarts, and
-security controls.
+`redd.it` redirects, public Threads posts, public Threads series, SearXNG
+results, non-social URLs, container restarts, and security controls.
 
 ## Table of Contents
 
@@ -32,6 +35,7 @@ security controls.
 - [Open WebUI Integration](#open-webui-integration)
 - [API Contract](#api-contract)
 - [Reddit Extraction](#reddit-extraction)
+- [Threads Extraction](#threads-extraction)
 - [Security](#security)
 - [Testing](#testing)
 - [Operations](#operations)
@@ -45,13 +49,15 @@ security controls.
 
 The project is designed to provide the following Open WebUI experience:
 
-1. A user asks a model to research a topic on Reddit.
-2. SearXNG discovers relevant Reddit URLs.
+1. A user asks a model to research a topic on Reddit or Threads.
+2. SearXNG discovers relevant URLs, or the user pastes a URL directly.
 3. Open WebUI sends those URLs to its external web loader.
-4. The adapter opens Reddit with a browser through a residential proxy.
+4. The adapter opens Reddit or Threads with a browser through a residential
+   proxy when browser rendering is needed.
 5. The adapter extracts posts, metadata, and comments into clean text.
 6. Open WebUI provides the extracted text to the model as context.
-7. The model can summarize and cite Reddit sources without manual browsing.
+7. The model can summarize and cite browser-rendered sources without manual
+   browsing.
 
 Users can also submit Reddit URLs directly:
 
@@ -59,6 +65,14 @@ Users can also submit Reddit URLs directly:
 https://www.reddit.com/r/selfhosted/
 https://www.reddit.com/r/OpenWebUI/comments/...
 https://redd.it/...
+```
+
+Users can also submit public Threads URLs directly:
+
+```text
+https://www.threads.com/@zuck/post/CuVY5CAvfTS
+https://www.threads.com/@notarisbernada/post/DXmWPvLklc1/...
+https://www.threads.net/@example/post/...
 ```
 
 ## Background
@@ -89,11 +103,11 @@ flowchart LR
     OW --> SX["SearXNG"]
     SX --> OW
     OW --> EL["External Web Loader"]
-    EL --> D{"Reddit domain?"}
-    D -- "Yes" --> PW["Chromium + Playwright\nXvfb, persistent context"]
+    EL --> D{"Browser-rendered domain?"}
+    D -- "Reddit or Threads" --> PW["Chromium + Playwright\nXvfb, persistent context"]
     PW --> RP["Rotating Residential Proxy\nsticky session"]
-    RP --> RD["Reddit"]
-    D -- "No" --> SF["Safe Direct Fetch\nReadability"]
+    RP --> RD["Reddit / Threads"]
+    D -- "Other public URL" --> SF["Safe Direct Fetch\nReadability"]
     SF --> WEB["Public Website"]
     PW --> EX["Text + Metadata"]
     SF --> EX
@@ -129,12 +143,45 @@ Request flow:
 8. Extract subreddit listings, posts, and comments from the DOM.
 9. Return `page_content` and `metadata` to Open WebUI.
 
-### Non-Reddit requests
+### Threads requests
+
+Threads support uses the same browser path and proxy configuration as Reddit.
+It does not create another browser container, public port, or persistent
+volume.
+
+The browser path is used for:
+
+- `threads.com`;
+- `www.threads.com`;
+- `threads.net`;
+- `www.threads.net`.
+
+Request flow:
+
+1. Validate the requested URL is on an allowed Threads host.
+2. Start or reuse the same persistent Chromium context used by Reddit.
+3. Load the page with JavaScript enabled.
+4. Block images, media, and fonts to reduce bandwidth.
+5. Wait for meaningful visible body text, post links, or a known failure state.
+6. Scroll until visible text stabilizes, bounded for small VPS capacity.
+7. Validate the final URL is still on a Threads host.
+8. Extract logged-out visible post, series, replies, post links, and visible
+   count text.
+9. Cut unrelated recommendation sections such as `Utas terkait` and
+   `Related threads`.
+10. Treat login walls after useful public content as non-fatal and record them
+    in metadata.
+
+The v1 Threads implementation intentionally does not log in, store Instagram
+or Threads account cookies, solve CAPTCHAs, or bypass login walls. It extracts
+only public content visible to a logged-out browser session.
+
+### Other requests
 
 Open WebUI supports one global external web-loader engine, so this adapter
 also acts as a dispatcher for ordinary URLs.
 
-For non-Reddit URLs, it:
+For URLs that are not Reddit or Threads, it:
 
 1. Allows only HTTP and HTTPS.
 2. Rejects hosts that resolve to private or non-public addresses.
@@ -156,9 +203,14 @@ The residential proxy is not used for this path.
 - Single-browser concurrency for small VPS deployments.
 - Subreddit, post, and comment extraction.
 - Support for `redd.it` short-link redirects.
+- Public Threads post and series extraction.
+- Threads login-wall detection without failing when useful public content was
+  already extracted.
+- Shared browser queue for Reddit and Threads, keeping browser concurrency at
+  one.
 - Detection of block, verification, CAPTCHA, and login walls.
 - Image, video, audio, and font blocking.
-- Safe direct fetching for non-Reddit sites.
+- Safe direct fetching for non-browser-rendered sites.
 - SSRF protection and DNS pinning.
 - Redirect destination validation.
 - Navigation and request timeouts.
@@ -191,6 +243,8 @@ The residential proxy is not used for this path.
 - `.proxy.env.example`: template for residential proxy credentials.
 - `reddit-loader/server.js`: API, routing, browser, extraction, and security
   implementation.
+- `reddit-loader/README.md`: short service-level reference for the loader
+  container.
 - `reddit-loader/Dockerfile`: image based on Microsoft Playwright.
 
 ## System Requirements
@@ -273,13 +327,13 @@ Only the `reddit-loader` container should receive this file.
 | `PORT` | `8080` | Internal service port |
 | `BROWSER_DATA_DIR` | `/data/browser` | Persistent Chromium profile |
 | `BROWSER_HEADLESS` | `false` | Run normal Chromium through Xvfb |
-| `NAVIGATION_TIMEOUT_MS` | `45000` | Reddit navigation timeout |
+| `NAVIGATION_TIMEOUT_MS` | `45000` | Browser navigation timeout for Reddit and Threads |
 | `REQUEST_TIMEOUT_MS` | `30000` | Direct HTTP request timeout |
 | `MAX_RESPONSE_BYTES` | `10485760` | Maximum non-Reddit body, 10 MiB |
 
 `BROWSER_HEADLESS=false` is important. During testing, Reddit rejected the
 `HeadlessChrome` fingerprint, while normal Chromium running in Xvfb
-succeeded.
+succeeded. Threads also uses this same non-headless Xvfb browser path.
 
 ## Installation and Deployment
 
@@ -418,6 +472,7 @@ Request:
 {
   "urls": [
     "https://www.reddit.com/r/selfhosted/",
+    "https://www.threads.com/@zuck/post/CuVY5CAvfTS",
     "https://example.com/"
   ]
 }
@@ -437,6 +492,19 @@ Response:
       "post_count": 3,
       "comment_count": 0,
       "elapsed_ms": 14000
+    }
+  },
+  {
+    "page_content": "Visible Threads content...",
+    "metadata": {
+      "source": "https://www.threads.com/@zuck/post/CuVY5CAvfTS",
+      "final_url": "https://www.threads.com/@zuck/post/CuVY5CAvfTS",
+      "title": "Page title",
+      "loader": "threads-playwright",
+      "post_count": 0,
+      "post_link_count": 23,
+      "login_wall": true,
+      "elapsed_ms": 19000
     }
   },
   {
@@ -510,6 +578,83 @@ A page is treated as unsuccessful when it contains signals such as:
 
 For recoverable failures, the browser context is closed, the sticky session
 is rotated, and the request is retried.
+
+## Threads Extraction
+
+Threads extraction is implemented in `reddit-loader/server.js` as a second
+browser-rendered route alongside Reddit.
+
+### Supported hosts
+
+- `threads.com`
+- `www.threads.com`
+- `threads.net`
+- `www.threads.net`
+
+### Supported content
+
+The loader extracts the public content visible to a logged-out browser:
+
+- main post text;
+- visible series or thread posts;
+- visible public replies before the login wall;
+- visible post links;
+- visible count text such as likes, replies, reposts, quotes, or Indonesian
+  equivalents when the page exposes them;
+- page title and final URL.
+
+Threads often renders useful content directly in body text without stable
+`article` nodes. The extractor therefore uses a combination of DOM signals,
+bounded scrolling, body text fallback, post-link discovery, and recommendation
+section trimming.
+
+### Login walls
+
+Threads may show prompts such as:
+
+```text
+Log in to see more replies.
+Log in or sign up for Threads
+```
+
+This is non-fatal when public content was already extracted. The response sets:
+
+```json
+{
+  "metadata": {
+    "loader": "threads-playwright",
+    "login_wall": true
+  }
+}
+```
+
+The request fails only when the page contains no useful public post text, or
+when the page appears private, unavailable, challenged, blocked, or too short
+to be useful.
+
+### Recommendation trimming
+
+The loader trims unrelated recommendation sections from the main body, including:
+
+- `Utas terkait`;
+- `Related threads`;
+- login/signup prompts after visible content.
+
+This keeps Open WebUI context focused on the requested post or series rather
+than unrelated recommendations.
+
+### Validated Threads results
+
+Validated on the VPS on June 26, 2026:
+
+| URL type | Loader | Extracted chars | Notes |
+|---|---|---:|---|
+| Single Threads post, `@zuck` | `threads-playwright` | 4,460 | Public post and visible replies/links extracted; login wall recorded |
+| Threads series, `@notarisbernada` | `threads-playwright` | 6,501 | Multi-post series extracted; `Related threads` excluded |
+| Ordinary URL, `example.com` | `direct` | 127 | Direct loader still works |
+
+The deployed container remained healthy after these tests, with observed
+`reddit-loader` memory around 285 MiB on a 3.8 GiB VPS.
 
 ## Security
 
@@ -607,12 +752,91 @@ https://www.reddit.com/r/selfhosted/
 https://example.com/
 ```
 
+#### Threads single post
+
+```text
+Buka dan rangkum isi URL Threads ini secara detail:
+
+https://www.threads.com/@zuck/post/CuVY5CAvfTS
+```
+
+Expected result:
+
+- the answer summarizes the public Threads post;
+- the answer does not say Threads is inaccessible;
+- a login wall may be mentioned, but useful public content should still be
+  present.
+
+#### Threads series
+
+```text
+Buka URL Threads ini dan rangkum semua poin penting dari utasnya. Jangan
+gunakan pengetahuan umum, hanya dari isi URL:
+
+https://www.threads.com/@notarisbernada/post/DXmWPvLklc1/langkah-detail-urus-pajak-balik-nama-waris-persiapan-dokumen-ahli-waris-warisan
+```
+
+Expected result:
+
+- the answer includes multiple points from the series, not only the target
+  post summary;
+- the answer should mention topics such as SKB PPh Waris, BPHTB,
+  Dispenda/Bapenda, BPN, and inheritance documents if present in the extracted
+  page;
+- unrelated `Related threads` / `Utas terkait` content should not be treated
+  as source content.
+
 ### Internal health test
 
 ```bash
 docker exec reddit-loader \
   node -e "fetch('http://127.0.0.1:8080/health').then(async r => console.log(r.status, await r.text()))"
 ```
+
+### Internal loader smoke test
+
+Run this from `/opt/owui-stack` on the VPS:
+
+```bash
+KEY=$(grep "^LOADER_API_KEY=" .env | cut -d= -f2-)
+
+docker exec -e TEST_KEY="$KEY" reddit-loader node - <<'NODE'
+const urls = [
+  "https://example.com/",
+  "https://www.threads.com/@zuck/post/CuVY5CAvfTS",
+  "https://www.threads.com/@notarisbernada/post/DXmWPvLklc1/langkah-detail-urus-pajak-balik-nama-waris-persiapan-dokumen-ahli-waris-warisan",
+];
+
+for (const url of urls) {
+  const res = await fetch("http://127.0.0.1:8080/load", {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${process.env.TEST_KEY}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ urls: [url] }),
+  });
+  const [item] = await res.json();
+  const content = item.page_content || "";
+  console.log(JSON.stringify({
+    url,
+    loader: item.metadata?.loader,
+    chars: content.length,
+    error: item.metadata?.error || null,
+    login_wall: item.metadata?.login_wall ?? null,
+    contains_related_threads: /Utas terkait|Related threads/i.test(content),
+  }, null, 2));
+}
+NODE
+```
+
+Expected high-level result:
+
+- `example.com` uses `direct`;
+- Threads URLs use `threads-playwright`;
+- Threads errors are `null`;
+- series extraction returns thousands of characters;
+- `contains_related_threads` is `false`.
 
 ### Basic security expectations
 
@@ -621,6 +845,7 @@ docker exec reddit-loader \
 - `file:///...`: rejected.
 - Ordinary public URL: processed by the `direct` loader.
 - Reddit URL: processed by the `reddit-playwright` loader.
+- Threads URL: processed by the `threads-playwright` loader.
 
 ### Validated production results
 
@@ -633,6 +858,9 @@ docker exec reddit-loader \
 - Unsafe loopback URL: rejected.
 - Request without token: HTTP 401.
 - Open WebUI `ExternalWebLoader`: succeeded.
+- Threads single post: `threads-playwright`, 4,460 extracted characters.
+- Threads series: `threads-playwright`, 6,501 extracted characters.
+- Threads recommendation section: excluded from extracted content.
 - `reddit-loader` restart: browser recovered successfully.
 - Public Open WebUI endpoint: remained HTTP 200.
 - All primary tests through the Open WebUI interface were confirmed working.
@@ -774,6 +1002,7 @@ Check that:
 Possible causes:
 
 - Reddit changed its DOM structure.
+- Threads changed its DOM structure or logged-out rendering behavior.
 - The page requires login.
 - Content had not finished loading.
 - The post was removed.
@@ -782,6 +1011,54 @@ Possible causes:
 
 Inspect the selectors in `reddit-loader/server.js` and the corresponding
 request logs.
+
+### Threads URL uses `direct` instead of `threads-playwright`
+
+Confirm the host is one of:
+
+```text
+threads.com
+www.threads.com
+threads.net
+www.threads.net
+```
+
+Then check logs:
+
+```bash
+docker logs --tail 100 reddit-loader
+```
+
+Expected successful log fields include:
+
+```json
+{
+  "loader": "threads-playwright",
+  "host": "www.threads.com"
+}
+```
+
+If the loader is still `direct`, rebuild and recreate the loader image:
+
+```bash
+cd /opt/owui-stack
+docker compose build reddit-loader
+docker compose up -d reddit-loader
+```
+
+### Threads only returns one short post
+
+Threads may lazy-render additional series content. The current extractor scrolls
+until body text stabilizes, but logged-out visibility can still vary by URL,
+region, session, and Threads product changes.
+
+Check:
+
+1. `docker logs --tail 100 reddit-loader` for `chars`.
+2. Whether `login_wall` is `true`.
+3. Whether the URL is a public post or series and not private, deleted, or
+   unavailable.
+4. Whether `contains_related_threads` remains false in the smoke test.
 
 ### High memory or swap usage
 
@@ -921,13 +1198,17 @@ CMD ["xvfb-run", "-a", "node", "server.js"]
 
 ## Status
 
-Status as of June 25, 2026:
+Status as of June 26, 2026:
 
 - deployed;
 - healthy;
 - integrated with Open WebUI;
 - user-interface tests passed;
-- Reddit and non-Reddit routing passed;
+- Reddit, Threads, and direct URL routing passed;
+- Threads single-post extraction passed;
+- Threads series extraction passed;
+- Threads login wall handled as non-fatal after useful public content;
+- Threads recommendation trimming passed;
 - basic security checks passed;
 - restart recovery passed.
 
@@ -935,7 +1216,7 @@ Recommended follow-up work:
 
 1. Monitor block rate, latency, bandwidth, RAM, and swap.
 2. Review logs regularly.
-3. Update selectors if Reddit changes its DOM.
+3. Update selectors if Reddit or Threads changes its DOM.
 4. Upgrade Open WebUI and Playwright in a controlled manner.
 5. Retire or repurpose any unused egress VPS.
 
