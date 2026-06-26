@@ -25,7 +25,7 @@ const proxyPass = process.env.PROXY_PASS || "";
 let browserContext;
 let browserStarting;
 let activeProxyUsername;
-let redditQueue = Promise.resolve();
+let browserQueue = Promise.resolve();
 
 const redditHosts = new Set([
   "reddit.com",
@@ -35,6 +35,13 @@ const redditHosts = new Set([
   "np.reddit.com",
   "redd.it",
   "www.redd.it",
+]);
+
+const threadsHosts = new Set([
+  "threads.com",
+  "www.threads.com",
+  "threads.net",
+  "www.threads.net",
 ]);
 
 function log(level, message, fields = {}) {
@@ -47,6 +54,11 @@ function log(level, message, fields = {}) {
 function isRedditHost(hostname) {
   const host = hostname.toLowerCase().replace(/\.$/, "");
   return redditHosts.has(host) || host.endsWith(".reddit.com");
+}
+
+function isThreadsHost(hostname) {
+  const host = hostname.toLowerCase().replace(/\.$/, "");
+  return threadsHosts.has(host);
 }
 
 function isPublicAddress(address) {
@@ -83,7 +95,7 @@ function isPublicAddress(address) {
   );
 }
 
-async function validateUrl(rawUrl, { redditOnly = false } = {}) {
+async function validateUrl(rawUrl, { redditOnly = false, threadsOnly = false } = {}) {
   let url;
   try {
     url = new URL(rawUrl);
@@ -100,14 +112,23 @@ async function validateUrl(rawUrl, { redditOnly = false } = {}) {
   if (redditOnly && !isRedditHost(url.hostname)) {
     throw new Error("Reddit navigation left an allowed domain");
   }
+  if (threadsOnly && !isThreadsHost(url.hostname)) {
+    throw new Error("Threads navigation left an allowed domain");
+  }
 
-  if (!isRedditHost(url.hostname)) {
+  if (!isRedditHost(url.hostname) && !isThreadsHost(url.hostname)) {
     const addresses = await dns.lookup(url.hostname, { all: true, verbatim: true });
     if (!addresses.length || addresses.some(({ address }) => !isPublicAddress(address))) {
       throw new Error("target resolves to a non-public address");
     }
   }
   return url;
+}
+
+function queueBrowserTask(task) {
+  const queued = browserQueue.then(task);
+  browserQueue = queued.catch(() => {});
+  return queued;
 }
 
 async function createSafeDispatcher(hostname) {
@@ -346,6 +367,33 @@ function detectRedditFailure(title, text) {
   return "";
 }
 
+function detectThreadsFailure(title, text, usefulLength) {
+  const haystack = `${title}\n${text}`.toLowerCase();
+  if (haystack.includes("captcha") || haystack.includes("confirm you're not a robot")) {
+    return "Threads requested a CAPTCHA or challenge";
+  }
+  if (haystack.includes("challenge") && usefulLength < 200) {
+    return "Threads requested a challenge";
+  }
+  if (
+    usefulLength < 120 &&
+    (haystack.includes("this content isn't available") ||
+      haystack.includes("this page isn't available") ||
+      haystack.includes("post unavailable") ||
+      haystack.includes("private"))
+  ) {
+    return "Threads post is private or unavailable";
+  }
+  if (
+    usefulLength < 120 &&
+    (haystack.includes("log in") || haystack.includes("sign up")) &&
+    !haystack.includes("/post/")
+  ) {
+    return "Threads requires login for this page";
+  }
+  return "";
+}
+
 async function extractRedditUnlocked(rawUrl) {
   await validateUrl(rawUrl, { redditOnly: true });
   const context = await getBrowserContext();
@@ -473,7 +521,7 @@ async function extractRedditUnlocked(rawUrl) {
 }
 
 function extractReddit(rawUrl) {
-  const task = redditQueue.then(async () => {
+  return queueBrowserTask(async () => {
     let lastError;
     for (let attempt = 1; attempt <= 3; attempt += 1) {
       try {
@@ -489,13 +537,191 @@ function extractReddit(rawUrl) {
     }
     throw lastError;
   });
-  redditQueue = task.catch(() => {});
-  return task;
+}
+
+async function extractThreadsUnlocked(rawUrl) {
+  await validateUrl(rawUrl, { threadsOnly: true });
+  const context = await getBrowserContext();
+  const page = await context.newPage();
+  const startedAt = Date.now();
+
+  try {
+    const response = await page.goto(rawUrl, { waitUntil: "domcontentloaded" });
+    let title = "";
+    let bodyText = "";
+    for (let waited = 0; waited <= 20000; waited += 2000) {
+      if (waited) await page.waitForTimeout(2000);
+      title = normalizeWhitespace(await page.title().catch(() => ""));
+      bodyText = normalizeWhitespace(
+        await page.locator("body").innerText({ timeout: 10000 }).catch(() => ""),
+      );
+      const contentSignals = await page
+        .locator("main, article, [role='article'], a[href*='/post/']")
+        .count()
+        .catch(() => 0);
+      if (contentSignals || bodyText.length >= 500 || detectThreadsFailure(title, bodyText, bodyText.length)) {
+        break;
+      }
+    }
+
+    await page.keyboard.press("Home").catch(() => {});
+    await page.waitForTimeout(1000);
+    let stableScrolls = 0;
+    for (let scroll = 0; scroll < 12; scroll += 1) {
+      const before = normalizeWhitespace(
+        await page.locator("body").innerText({ timeout: 5000 }).catch(() => ""),
+      ).length;
+      await page.mouse.wheel(0, 1200).catch(() => {});
+      await page.waitForTimeout(1200);
+      const after = normalizeWhitespace(
+        await page.locator("body").innerText({ timeout: 5000 }).catch(() => ""),
+      ).length;
+      stableScrolls = after - before < 100 ? stableScrolls + 1 : 0;
+      if (stableScrolls >= 3) break;
+    }
+
+    const finalUrl = page.url();
+    await validateUrl(finalUrl, { threadsOnly: true });
+
+    const extracted = await page.evaluate(() => {
+      const clean = (value) =>
+        String(value || "")
+          .replace(/\u00a0/g, " ")
+          .replace(/[ \t]+\n/g, "\n")
+          .replace(/\n{3,}/g, "\n\n")
+          .trim();
+
+      const cutNoise = (value) => {
+        const markers = [
+          "\nUtas terkait",
+          "\nRelated threads",
+          "\nLog in to see more replies",
+          "\nLog in to see more",
+          "\nLog in or sign up for Threads",
+          "\nMasuk untuk melihat balasan lainnya",
+          "\nMasuk untuk melihat lainnya",
+        ];
+        let text = clean(value);
+        for (const marker of markers) {
+          const index = text.toLowerCase().indexOf(marker.toLowerCase());
+          if (index >= 0) text = text.slice(0, index);
+        }
+        return clean(text);
+      };
+
+      const isUsefulPostText = (value) => {
+        const text = clean(value);
+        const lower = text.toLowerCase();
+        if (text.length < 20) return false;
+        if (/^(home|search|create|activity|profile|threads|log in|sign up)$/i.test(text)) return false;
+        if (lower.includes("\u00a9") && text.length < 80) return false;
+        return true;
+      };
+
+      const bodyText = clean(document.body?.innerText || "");
+      const mainText = cutNoise(document.querySelector("main")?.innerText || bodyText);
+      const loginWall =
+        /log in to see more replies|log in to see more|masuk untuk melihat balasan|masuk untuk melihat lainnya/i.test(
+          bodyText,
+        );
+
+      const articleNodes = Array.from(
+        document.querySelectorAll("article, [role='article']"),
+      ).slice(0, 80);
+      const seenPosts = new Set();
+      const posts = articleNodes
+        .map((node) => cutNoise(node.innerText || node.textContent || ""))
+        .filter(isUsefulPostText)
+        .filter((text) => {
+          const key = text.replace(/\s+/g, " ").slice(0, 240);
+          if (seenPosts.has(key)) return false;
+          seenPosts.add(key);
+          return true;
+        });
+
+      const postLinks = Array.from(document.querySelectorAll("a[href*='/post/']"))
+        .map((anchor) => {
+          try {
+            return new URL(anchor.getAttribute("href"), location.href).toString();
+          } catch {
+            return "";
+          }
+        })
+        .filter((href) => /^https:\/\/(www\.)?threads\.(com|net)\//i.test(href));
+      const uniquePostLinks = Array.from(new Set(postLinks)).slice(0, 100);
+
+      const counts = {};
+      const countMatches = bodyText.match(/\b[\d,.KMkm]+\s+(likes?|replies|reply|reposts?|quotes?|suka|balasan|posting ulang|kutipan)\b/g);
+      if (countMatches) {
+        counts.visible = Array.from(new Set(countMatches)).slice(0, 20);
+      }
+
+      return {
+        bodyText,
+        mainText,
+        posts,
+        postLinks: uniquePostLinks,
+        postLinkCount: uniquePostLinks.length,
+        loginWall,
+        counts,
+      };
+    });
+
+    const sections = [];
+    if (extracted.posts.length) {
+      sections.push(`THREAD POSTS\n\n${extracted.posts.join("\n\n---\n\n")}`);
+    } else if (extracted.mainText) {
+      sections.push(extracted.mainText);
+    }
+
+    if (extracted.postLinks.length) {
+      sections.push(`VISIBLE POST LINKS\n\n${extracted.postLinks.join("\n")}`);
+    }
+
+    const pageContent = normalizeWhitespace([title, ...sections].filter(Boolean).join("\n\n"));
+    const usefulText = normalizeWhitespace(sections.join("\n\n"));
+    const failure = detectThreadsFailure(title, extracted.bodyText, usefulText.length);
+    if (failure) throw new Error(failure);
+    if (
+      !extracted.posts.length &&
+      !extracted.postLinks.length &&
+      /\b(log in|sign up)\b|masuk|daftar/i.test(extracted.bodyText)
+    ) {
+      throw new Error("Threads requires login for this page");
+    }
+    if (usefulText.length < 80) {
+      throw new Error("Threads page contained too little readable content");
+    }
+
+    return {
+      page_content: pageContent,
+      metadata: {
+        source: rawUrl,
+        final_url: finalUrl,
+        title,
+        http_status: response?.status() || null,
+        post_count: extracted.posts.length,
+        post_link_count: extracted.postLinkCount,
+        visible_counts: extracted.counts.visible || [],
+        login_wall: extracted.loginWall,
+        elapsed_ms: Date.now() - startedAt,
+        loader: "threads-playwright",
+      },
+    };
+  } finally {
+    await page.close();
+  }
+}
+
+function extractThreads(rawUrl) {
+  return queueBrowserTask(() => extractThreadsUnlocked(rawUrl));
 }
 
 async function extractUrl(rawUrl) {
   const parsed = await validateUrl(rawUrl);
-  return isRedditHost(parsed.hostname) ? extractReddit(rawUrl) : extractDirect(rawUrl);
+  if (isRedditHost(parsed.hostname)) return extractReddit(rawUrl);
+  if (isThreadsHost(parsed.hostname)) return extractThreads(rawUrl);
+  return extractDirect(rawUrl);
 }
 
 function sendJson(response, statusCode, payload) {
