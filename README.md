@@ -5,6 +5,10 @@ Reddit is blocked or unreliable to search, open, and extract Reddit content
 automatically. It also supports public logged-out Threads post and series URLs
 through the same browser infrastructure.
 
+The same Docker Compose stack also includes an isolated Open Terminal instance
+for model-driven command execution, file operations, data analysis, and code
+execution from Open WebUI chats.
+
 The project preserves Open WebUI's existing web-search workflow:
 
 - SearXNG continues to discover search results.
@@ -33,6 +37,7 @@ results, non-social URLs, container restarts, and security controls.
 - [Environment Configuration](#environment-configuration)
 - [Installation and Deployment](#installation-and-deployment)
 - [Open WebUI Integration](#open-webui-integration)
+- [Open Terminal](#open-terminal)
 - [API Contract](#api-contract)
 - [Reddit Extraction](#reddit-extraction)
 - [Threads Extraction](#threads-extraction)
@@ -112,12 +117,13 @@ flowchart LR
     PW --> EX["Text + Metadata"]
     SF --> EX
     EX --> OW
+    OW --> OT["Open Terminal\nisolated command and file workspace"]
 ```
 
-All communication between Open WebUI, SearXNG, and `reddit-loader` takes
-place on the private Docker network `owui-net`.
+All communication between Open WebUI, SearXNG, `reddit-loader`, and
+`open-terminal` takes place on the private Docker network `owui-net`.
 
-`reddit-loader` does not expose a public host port.
+Neither `reddit-loader` nor `open-terminal` exposes a public host port.
 
 ## How It Works
 
@@ -220,6 +226,8 @@ The residential proxy is not used for this path.
 - Restart-safe persistent Chromium profile.
 - Structured logs without credential disclosure.
 - No additional public port.
+- Isolated Open Terminal workspace with persistent `/home/user` storage.
+- Bearer-authenticated terminal access configured server-side in Open WebUI.
 
 ## Repository Structure
 
@@ -229,6 +237,8 @@ The residential proxy is not used for this path.
 |-- compose.yaml
 |-- .env.example
 |-- .proxy.env.example
+|-- OPEN-TERMINAL-TEST-CASES.md
+|-- plan.md
 |-- .gitignore
 `-- reddit-loader/
     |-- Dockerfile
@@ -241,6 +251,10 @@ The residential proxy is not used for this path.
 - `compose.yaml`: integrated Docker Compose example.
 - `.env.example`: template for stack secrets.
 - `.proxy.env.example`: template for residential proxy credentials.
+- `OPEN-TERMINAL-TEST-CASES.md`: manual validation scenarios and practical
+  Open Terminal use cases.
+- `plan.md`: installation, verification, and rollback plan used for the
+  production Open Terminal deployment.
 - `reddit-loader/server.js`: API, routing, browser, extraction, and security
   implementation.
 - `reddit-loader/README.md`: short service-level reference for the loader
@@ -282,6 +296,7 @@ Used by Docker Compose:
 WEBUI_SECRET_KEY=generate-a-strong-secret
 SEARXNG_SECRET=generate-a-strong-secret
 LOADER_API_KEY=generate-a-separate-strong-secret
+OPEN_TERMINAL_API_KEY=generate-a-separate-strong-secret
 ```
 
 Generate a secret with:
@@ -371,6 +386,9 @@ chmod 600 .env .proxy.env
 Ensure the `LOADER_API_KEY` in `.env` is the same token supplied to Open
 WebUI.
 
+Ensure `OPEN_TERMINAL_API_KEY` is unique and matches the Bearer token stored
+in the Open WebUI Admin Panel terminal connection.
+
 ### 3. Validate Compose
 
 ```bash
@@ -392,21 +410,37 @@ docker compose ps reddit-loader
 
 Wait until its status is `healthy`.
 
-### 6. Start or recreate Open WebUI
+### 6. Start Open Terminal
+
+```bash
+docker compose pull open-terminal
+docker compose up -d --no-deps open-terminal
+docker compose ps open-terminal
+```
+
+Verify connectivity from the Open WebUI container:
+
+```bash
+docker exec open-webui curl -fsS http://open-terminal:8000/health
+```
+
+The expected response is `{"status":"ok"}`.
+
+### 7. Start or recreate Open WebUI
 
 ```bash
 docker compose up -d open-webui
 docker compose ps
 ```
 
-### 7. Verify network isolation
+### 8. Verify network isolation
 
 ```bash
 docker compose ps
 ```
 
-`reddit-loader` should show only `8080/tcp`, not a host mapping such as
-`0.0.0.0:8080->8080/tcp`.
+`reddit-loader` and `open-terminal` should show only their container ports,
+not host mappings such as `0.0.0.0:8000->8000/tcp`.
 
 ## Open WebUI Integration
 
@@ -441,6 +475,43 @@ Admin Panel
 ```
 
 Enable Web Search in the chat when searching through SearXNG.
+
+## Open Terminal
+
+The production connection is named `VPS Open Terminal` and uses:
+
+| Setting | Value |
+|---|---|
+| URL | `http://open-terminal:8000` |
+| Authentication | Bearer |
+| Storage | `open-terminal-data:/home/user` |
+| Network | `owui-net` |
+| Access Control | Private, with no additional grants |
+| Public host port | None |
+
+Configure it from:
+
+```text
+Admin Panel
+-> Settings
+-> Integrations
+-> Open Terminal
+```
+
+Enable the connection, keep Access Control private, and enable Native Function
+Calling for the selected model. In a chat, use the cloud button and select
+`VPS Open Terminal` from the **System** section.
+
+The production end-to-end test used `deepseek-v4-flash` to run
+`cat /etc/os-release`. The terminal returned
+`Debian GNU/Linux 13 (trixie)`, confirming that model tool calling,
+authentication, command execution, and response delivery all worked.
+
+See [OPEN-TERMINAL-TEST-CASES.md](OPEN-TERMINAL-TEST-CASES.md) for manual
+tests and recommended use cases. The setup follows the official Open WebUI
+[installation](https://docs.openwebui.com/features/open-terminal/setup/installation/)
+and [connection](https://docs.openwebui.com/features/open-terminal/setup/connecting/)
+guides.
 
 ## API Contract
 
@@ -663,6 +734,9 @@ The deployed container remained healthy after these tests, with observed
 - `reddit-loader` is connected only to `owui-net`.
 - It has no public host port.
 - Open WebUI consumes the endpoint from the internal Docker network.
+- `open-terminal` is reachable only through `owui-net` and has no host port.
+- Open Terminal has no host-directory mount, Docker socket, privileged mode,
+  or additional Linux capabilities.
 
 ### Authentication
 
@@ -694,6 +768,8 @@ validated again.
 - Secrets are not stored in the repository.
 - Proxy credentials are kept in `.proxy.env`.
 - The loader token is kept in `.env`.
+- The Open Terminal token is kept in `.env` and in Open WebUI's server-side
+  Admin Panel connection.
 - Both files should use mode 600.
 - Structured logging filters sensitive field names.
 - Do not paste container environment output into public issues or logs.
@@ -864,6 +940,12 @@ Expected high-level result:
 - `reddit-loader` restart: browser recovered successfully.
 - Public Open WebUI endpoint: remained HTTP 200.
 - All primary tests through the Open WebUI interface were confirmed working.
+- Open Terminal health check: HTTP 200 with `{"status":"ok"}`.
+- Open Terminal request with the active key: HTTP 200.
+- Open Terminal request with a missing or incorrect key: HTTP 401.
+- Open Terminal persistence after container restart: passed.
+- Open Terminal end-to-end model command execution: passed.
+- Open Terminal public port isolation: passed.
 
 ## Operations
 
@@ -908,7 +990,7 @@ docker compose ps reddit-loader
 
 ```bash
 free -h
-docker stats --no-stream open-webui reddit-loader searxng caddy
+docker stats --no-stream open-webui open-terminal reddit-loader searxng caddy
 docker system df
 ```
 
@@ -917,6 +999,17 @@ docker system df
 ```bash
 curl -I https://your-openwebui-domain.example/
 ```
+
+### Open Terminal operations
+
+```bash
+docker compose ps open-terminal
+docker logs --since 1h open-terminal
+docker exec open-webui curl -fsS http://open-terminal:8000/health
+```
+
+Restarting `open-terminal` preserves files stored under `/home/user` through
+the `open-terminal-data` named volume.
 
 ## Troubleshooting
 
@@ -1195,10 +1288,12 @@ CMD ["xvfb-run", "-a", "node", "server.js"]
 - Residential bandwidth has a cost.
 - The adapter is not intended for large-scale crawling. It is deliberately
   limited for low-volume Open WebUI use.
+- Open Terminal executes model-requested commands. Keep access private and
+  review destructive commands or sensitive data operations carefully.
 
 ## Status
 
-Status as of June 26, 2026:
+Status as of June 28, 2026:
 
 - deployed;
 - healthy;
@@ -1211,6 +1306,12 @@ Status as of June 26, 2026:
 - Threads recommendation trimming passed;
 - basic security checks passed;
 - restart recovery passed.
+- Open Terminal deployed as an isolated container;
+- Open Terminal Bearer authentication passed;
+- persistent terminal storage passed restart testing;
+- no Open Terminal public port is exposed;
+- private Admin Panel integration passed;
+- end-to-end model command execution passed.
 
 Recommended follow-up work:
 
